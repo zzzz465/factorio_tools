@@ -27,10 +27,13 @@ from os import path
 import re
 import zipfile
 
+from construct.core import ConstructError
+
 from . import parse
 
 
 BUFFER_SIZE = 2**20
+LEVEL_WITH_TAGS_DIFF_LIMIT = 256 * 1024 * 1024
 class TokenKind(enum.IntEnum):
     OPEN_TAG = 1
     CLOSE_TAG = 2
@@ -163,14 +166,26 @@ def find_files(level_zip):
 
         if re.match(r'.*/level-heuristic-\d+', name):
             files['heuristic'] = level_zip.open(name)
+            files['heuristic_info'] = level_zip.getinfo(name)
+            files['heuristic_path'] = name
 
         if re.match(r'.*/level_with_tags_tick_\d+\.dat', name):
             files['level_with_tags'] = level_zip.open(name)
+            files['level_with_tags_info'] = level_zip.getinfo(name)
+            files['level_with_tags_path'] = name
 
-    files['script'] = level_zip.open(f'{files["root"]}/script.dat')
+    script_path = f'{files["root"]}/script.dat'
+    files['script'] = level_zip.open(script_path)
+    files['script_info'] = level_zip.getinfo(script_path)
+    files['script_path'] = script_path
     return files
 
-def file_differs(a, b):
+def file_differs(a, b, a_info=None, b_info=None):
+    if a_info is not None and b_info is not None:
+        if a_info.CRC == b_info.CRC and a_info.file_size == b_info.file_size:
+            return False
+        return True
+
     try:
         bytes_a = None
         while bytes_a != b'':
@@ -215,9 +230,16 @@ def diff_script_objects(a, b, path=[]):
 
 
 def script_dat_to_object(level_files):
-    print(f"parsing {level_files['root']}/script.dat")
-    decoded = parse.ScriptDat.parse_stream(level_files['script'])
-    level_files['script'].seek(0)
+    script_path = level_files.get('script_path', f"{level_files['root']}/script.dat")
+    print(f"parsing {script_path}")
+    try:
+        decoded = parse.ScriptDat.parse_stream(level_files['script'])
+    except ConstructError as exc:
+        print(f"Failed to parse script.dat: {exc}")
+        return None
+    finally:
+        level_files['script'].seek(0)
+
     return parse.container_to_object(decoded)
 
 def diff_tagged_files(a_file, b_file):
@@ -277,32 +299,69 @@ def analyze(args):
         report.extractall(path.dirname(args.path))
         args.path = args.path[:-4]
 
-    ref_zip = zipfile.ZipFile(path.join(args.path, 'reference-level.zip'))
-    des_zip = zipfile.ZipFile(path.join(args.path, 'desynced-level.zip'))
+    candidates = [
+        ('reference-level.zip', 'desynced-level.zip'),
+        ('server-level.zip', 'client-level.zip'),
+    ]
+    for ref_name, des_name in candidates:
+        ref_file = path.join(args.path, ref_name)
+        des_file = path.join(args.path, des_name)
+        if path.exists(ref_file) and path.exists(des_file):
+            break
+    else:
+        raise FileNotFoundError("Expected level archives not found in desync report")
+
+    ref_zip = zipfile.ZipFile(ref_file)
+    des_zip = zipfile.ZipFile(des_file)
 
     ref_files = find_files(ref_zip)
     des_files = find_files(des_zip)
 
-    if file_differs(ref_files['heuristic'], des_files['heuristic']):
+    if file_differs(
+        ref_files['heuristic'],
+        des_files['heuristic'],
+        ref_files.get('heuristic_info'),
+        des_files.get('heuristic_info'),
+    ):
         print()
         print("level-heuristic differs")
         print("-----------------------")
         diff_tagged_files(ref_files['heuristic'], des_files['heuristic'])
 
-    if file_differs(ref_files['script'], des_files['script']):
+    script_differs = file_differs(
+        ref_files['script'],
+        des_files['script'],
+        ref_files.get('script_info'),
+        des_files.get('script_info'),
+    )
+    if script_differs:
         print()
         print("script.dat differs")
         print("------------------")
 
-        des_script = script_dat_to_object(des_files)
-        ref_script = script_dat_to_object(ref_files)
-        for diff in diff_script_objects(ref_script, des_script):
-            print(f"Path: {diff[0]}")
-            print(f"Reference value: {json.dumps(diff[1])}")
-            print(f"Desynced value: {json.dumps(diff[2])}")
+        ref_script_obj = script_dat_to_object(ref_files)
+        des_script_obj = script_dat_to_object(des_files)
 
-    if file_differs(ref_files['level_with_tags'], des_files['level_with_tags']):
+        if ref_script_obj is None or des_script_obj is None:
+            print("Unable to parse script.dat in one of the archives; skipping detailed diff.")
+        else:
+            for diff in diff_script_objects(ref_script_obj, des_script_obj):
+                print(f"Path: {diff[0]}")
+                print(f"Reference value: {json.dumps(diff[1])}")
+                print(f"Desynced value: {json.dumps(diff[2])}")
+
+    if file_differs(
+        ref_files['level_with_tags'],
+        des_files['level_with_tags'],
+        ref_files.get('level_with_tags_info'),
+        des_files.get('level_with_tags_info'),
+    ):
         print()
         print("level_with_tags.dat differs")
         print("---------------------------")
-        diff_tagged_files(ref_files['level_with_tags'], des_files['level_with_tags'])
+        info = ref_files.get('level_with_tags_info') or des_files.get('level_with_tags_info')
+        if info is not None and info.file_size > LEVEL_WITH_TAGS_DIFF_LIMIT:
+            size_mb = info.file_size / (1024 * 1024)
+            print(f"level_with_tags.dat is {size_mb:.1f} MiB; skipping detailed diff.")
+        else:
+            diff_tagged_files(ref_files['level_with_tags'], des_files['level_with_tags'])
